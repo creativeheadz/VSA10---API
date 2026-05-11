@@ -5,6 +5,16 @@ import sys
 import platform
 import logging
 
+# Local helper modules (lazy imports so a missing one doesn't kill startup).
+try:
+    import pickers
+    import recents
+    import output_utils
+    import safety
+except Exception as _helper_err:
+    pickers = recents = output_utils = safety = None
+    print(f"Warning: helper modules failed to import: {_helper_err}")
+
 # Setup logging
 logging.basicConfig(
     filename='vsa_api_tool.log',
@@ -80,9 +90,66 @@ def get_script_friendly_name(file_path):
                         return friendly_name
     except Exception as e:
         logger.warning(f"Failed to extract friendly name from {file_path}: {e}")
-    
-    # Return None if no friendly name found
-    return None
+
+    # Fallback: derive from filename ("get_all_devices.py" -> "Get All Devices").
+    stem = os.path.splitext(os.path.basename(file_path))[0]
+    return stem.replace('_', ' ').title()
+
+def prompt_for_arg(arg_name):
+    """Resolve a function argument value.
+
+    Offers: manual entry, recently-used values, and (when an entity picker is registered for
+    this arg name) an interactive list pulled from the VSA API.
+    Returns (value, label) where label is best-effort human-readable for recents storage.
+    """
+    picker_cfg = pickers.resolve_picker(arg_name) if pickers else None
+    recent = recents.get_recent_ids(arg_name) if recents else []
+
+    # Fast path: no picker, no recents — just ask.
+    if not picker_cfg and not recent:
+        return input(f"Enter value for '{arg_name}': ").strip(), ''
+
+    while True:
+        print(f"\n  '{arg_name}'  options:")
+        idx = 1
+        action_map = {}
+
+        print(f"    [{idx}] Enter manually")
+        action_map[str(idx)] = ('manual', None)
+        idx += 1
+
+        if picker_cfg:
+            label = picker_cfg['label']
+            online_hint = ' (online by default)' if picker_cfg['supports_online_filter'] else ''
+            print(f"    [{idx}] Pick from {label}s{online_hint}")
+            action_map[str(idx)] = ('pick', None)
+            idx += 1
+
+        for r in recent:
+            label = r.get('label', '')
+            disp = f"{r['id']}" + (f" — {label}" if label else '')
+            print(f"    [{idx}] Recent: {disp}")
+            action_map[str(idx)] = ('recent', r)
+            idx += 1
+
+        choice = input(f"  > ").strip()
+        if choice not in action_map:
+            print("  (invalid choice)")
+            continue
+        kind, payload = action_map[choice]
+        if kind == 'manual':
+            v = input(f"Enter value for '{arg_name}': ").strip()
+            return v, ''
+        if kind == 'pick':
+            v = pickers.pick(arg_name)
+            if v:
+                # Try to find a label from picker cache — fall back to empty.
+                return v, ''
+            # Fell through (user cancelled picker) — loop again.
+            continue
+        if kind == 'recent':
+            return payload['id'], payload.get('label', '')
+
 
 def load_and_run_module(file_path):
     """Load and run a Python module from the given path, handling null bytes."""
@@ -192,36 +259,59 @@ def load_and_run_module(file_path):
         setattr(module, '__name__', module_name)
         sys.modules[module_name] = module
 
-        try:
-            compiled_code = compile(source_code, file_path, 'exec')
-            exec(compiled_code, module.__dict__)
-        except Exception as exec_err:
-            logger.error(f"Error executing code in {file_path}: {exec_err}")
-            raise
+        # Resolve required args BEFORE exec'ing the module body — picker/recents prompts.
+        # We do a lightweight parse-then-introspect: exec under capture, then ask, then call.
+        resolved_args = []  # list of (arg_name, value)
 
-        if hasattr(module, 'main'):
-            logger.info(f"Found main() in {module_name}, running it.")
-            module.main()
-        elif hasattr(module, module_name):
-            logger.info(f"Found {module_name}() in {module_name}, running it.")
-            func = getattr(module, module_name)
-            import inspect
-            sig = inspect.signature(func)
-            required_args = [param for param, param_obj in sig.parameters.items()
-                           if param_obj.default == inspect.Parameter.empty and
-                              param_obj.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
-            if required_args:
-                args = []
-                print(f"\nFunction {module_name} requires {len(required_args)} argument(s):")
-                for arg_name in required_args:
-                    arg_value = input(f"Enter value for '{arg_name}': ")
-                    args.append(arg_value)
-                func(*args)
+        cap = output_utils.capture_stdout() if output_utils else None
+        if cap:
+            cap.__enter__()
+        try:
+            try:
+                compiled_code = compile(source_code, file_path, 'exec')
+                exec(compiled_code, module.__dict__)
+            except Exception as exec_err:
+                logger.error(f"Error executing code in {file_path}: {exec_err}")
+                raise
+
+            if hasattr(module, 'main'):
+                logger.info(f"Found main() in {module_name}, running it.")
+                module.main()
+            elif hasattr(module, module_name):
+                logger.info(f"Found {module_name}() in {module_name}, running it.")
+                func = getattr(module, module_name)
+                import inspect
+                sig = inspect.signature(func)
+                required_args = [param for param, param_obj in sig.parameters.items()
+                               if param_obj.default == inspect.Parameter.empty and
+                                  param_obj.kind == inspect.Parameter.POSITIONAL_OR_KEYWORD]
+                if required_args:
+                    print(f"\nFunction {module_name} requires {len(required_args)} argument(s):")
+                    for arg_name in required_args:
+                        value, label = prompt_for_arg(arg_name)
+                        resolved_args.append((arg_name, value, label))
+                    func(*[v for _, v, _ in resolved_args])
+                else:
+                    func()
             else:
-                func()
-        else:
-            logger.info(f"No main or {module_name} function found in {module_name}.")
-            print(f"Module {module_name} executed (no 'main' or '{module_name}' function found).")
+                logger.info(f"No main or {module_name} function found in {module_name}.")
+                print(f"Module {module_name} executed (no 'main' or '{module_name}' function found).")
+        finally:
+            if cap:
+                cap.__exit__(None, None, None)
+
+        # Record successful arg values for next-time quick-pick.
+        if recents:
+            for arg_name, value, label in resolved_args:
+                if value:
+                    recents.record_id(arg_name, value, label)
+
+        # Offer post-run actions if output is large or contains JSON.
+        if cap:
+            try:
+                output_utils.offer_post_actions(cap.text)
+            except Exception as post_err:
+                logger.warning(f"post-run action failed: {post_err}")
 
         input("\nPress Enter to continue...")
 
@@ -467,13 +557,31 @@ def display_connection_info(connection_status):
 def display_directory_menu():
     """Display a menu of subdirectories."""
     root_path, subdirs = get_subdirectories()
-    
+
     # Get connection status
     connection_status = check_connectivity()
 
     while True:
         clear_screen()
-        print_menu_header("VSAx API Tool - Directory Menu")
+        title = "VSAx API Tool - Directory Menu"
+        if safety and safety.is_dry_run():
+            title += "   [DRY-RUN]"
+        print_menu_header(title)
+
+        # Recent scripts section.
+        recent_scripts = recents.get_recent_scripts() if recents else []
+        # Filter recents to files that still exist.
+        recent_scripts = [
+            s for s in recent_scripts
+            if os.path.exists(os.path.join(root_path, s.get('folder', ''), s.get('file', '')))
+        ]
+        if recent_scripts:
+            print(f"  {Colors.BOLD}{Colors.CYAN}Recently used:{Colors.END}")
+            for i, s in enumerate(recent_scripts, 1):
+                fpath = os.path.join(root_path, s['folder'], s['file'])
+                fname = get_script_friendly_name(fpath) or s['file']
+                print_menu_item(f"r{i}", f"{s['folder']} / {fname}", Colors.GREEN)
+            print()
 
         # Sort subdirectories alphabetically for consistency
         subdirs.sort()
@@ -481,18 +589,33 @@ def display_directory_menu():
         for i, subdir in enumerate(subdirs, 1):
             print_menu_item(i, subdir)
 
-        # For the exit option, keep consistent formatting
         print_menu_item(len(subdirs) + 1, f"{Colors.YELLOW}Exit{Colors.END}", Colors.RED)
-        
+
         # Display connection information before the footer
         display_connection_info(connection_status)
-        
+        dry_state = 'ON' if (safety and safety.is_dry_run()) else 'off'
+        print(f"\n  {Colors.CYAN}[d] toggle dry-run (currently {dry_state}){Colors.END}")
         print_menu_footer()
 
         try:
-            choice_str = input(f"{Colors.GREEN}Enter your choice: {Colors.END}")
+            choice_str = input(f"{Colors.GREEN}Enter your choice: {Colors.END}").strip().lower()
+            if not choice_str:
+                continue
+            if choice_str == 'd':
+                if safety:
+                    safety.set_dry_run(not safety.is_dry_run())
+                continue
+            if choice_str.startswith('r') and choice_str[1:].isdigit():
+                idx = int(choice_str[1:])
+                if 1 <= idx <= len(recent_scripts):
+                    s = recent_scripts[idx - 1]
+                    run_script_file(os.path.join(root_path, s['folder']), s['file'])
+                    continue
+                print(f"\n{Colors.RED}No recent script at that slot.{Colors.END}")
+                input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
+                continue
             if not choice_str.isdigit():
-                print(f"\n{Colors.RED}Please enter a number.{Colors.END}")
+                print(f"\n{Colors.RED}Please enter a number, 'r#' for recent, or 'd' to toggle dry-run.{Colors.END}")
                 input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
                 continue
 
@@ -507,94 +630,103 @@ def display_directory_menu():
             else:
                 print(f"\n{Colors.RED}Invalid choice. Please try again.{Colors.END}")
                 input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
-        except ValueError: # Should be caught by isdigit check, but keep for safety
-            print(f"\n{Colors.RED}Please enter a number.{Colors.END}")
-            input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
         except KeyboardInterrupt:
-             print(f"\n{Colors.YELLOW}Exiting program...{Colors.END}")
-             break
+            print(f"\n{Colors.YELLOW}Exiting program...{Colors.END}")
+            break
+
+
+def run_script_file(directory, file_name):
+    """Run a single script file, handling sys.path, destructive-confirm, and recents."""
+    selected_file = os.path.join(directory, file_name)
+    if safety and safety.is_destructive(file_name):
+        if not safety.confirm_destructive(file_name):
+            print(f"{Colors.YELLOW}Aborted.{Colors.END}")
+            input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
+            return
+    print(f"\n{Colors.YELLOW}Running {file_name}...{Colors.END}")
+    if safety and safety.is_dry_run():
+        print(f"{Colors.CYAN}(dry-run is ON — only GETs will hit the API){Colors.END}")
+    script_dir = os.path.dirname(selected_file)
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    root_api_dir = os.path.dirname(os.path.abspath(__file__))
+    if root_api_dir not in sys.path:
+        sys.path.insert(1, root_api_dir)
+    try:
+        if recents:
+            recents.record_script(os.path.basename(directory), file_name)
+        load_and_run_module(selected_file)
+    finally:
+        if script_dir in sys.path and script_dir != root_api_dir:
+            try:
+                sys.path.remove(script_dir)
+            except ValueError:
+                pass
 
 
 def display_files_menu(directory):
-    """Display a menu of Python files in the directory."""
+    """Display a menu of Python files in the directory, with type-to-filter."""
     py_files = get_python_files(directory)
     friendly_names = {}
-    
+
     # Pre-fetch friendly names for each file
     for file in py_files:
         file_path = os.path.join(directory, file)
-        friendly_name = get_script_friendly_name(file_path)
-        friendly_names[file] = friendly_name
+        friendly_names[file] = get_script_friendly_name(file_path)
+
+    py_files.sort()
+    filter_text = ''
 
     while True:
         clear_screen()
         dir_name = os.path.basename(directory)
-        print_menu_header(f"Scripts in '{dir_name}'")
+        title = f"Scripts in '{dir_name}'"
+        if filter_text:
+            title += f"   [filter: '{filter_text}']"
+        print_menu_header(title)
 
-        # Sort files alphabetically for consistency
-        py_files.sort()
+        # Apply filter
+        if filter_text:
+            ft = filter_text.lower()
+            visible = [f for f in py_files
+                       if ft in f.lower() or ft in (friendly_names.get(f) or '').lower()]
+        else:
+            visible = py_files
 
-        for i, file in enumerate(py_files, 1):
-            # Use only the friendly name if available, otherwise use the filename
-            if friendly_names[file]:
-                display_text = friendly_names[file]
-            else:
-                display_text = file
+        for i, file in enumerate(visible, 1):
+            display_text = friendly_names.get(file) or file
+            if safety and safety.is_destructive(file):
+                display_text = f"{Colors.RED}⚠ {display_text}{Colors.END}"
             print_menu_item(i, display_text)
 
-        # For the back option, keep consistent formatting
-        print_menu_item(len(py_files) + 1, f"{Colors.YELLOW}Back to Directory Menu{Colors.END}", Colors.CYAN)
+        print_menu_item(len(visible) + 1, f"{Colors.YELLOW}Back to Directory Menu{Colors.END}", Colors.CYAN)
+        print(f"\n  {Colors.CYAN}Tip: type '/text' to filter, '/' to clear.{Colors.END}")
         print_menu_footer()
 
         try:
-            choice_str = input(f"{Colors.GREEN}Enter your choice: {Colors.END}")
+            choice_str = input(f"{Colors.GREEN}Enter your choice: {Colors.END}").strip()
+            if not choice_str:
+                continue
+            if choice_str.startswith('/'):
+                filter_text = choice_str[1:].strip()
+                continue
             if not choice_str.isdigit():
-                print(f"\n{Colors.RED}Please enter a number.{Colors.END}")
+                print(f"\n{Colors.RED}Please enter a number or '/filter'.{Colors.END}")
                 input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
                 continue
 
             choice = int(choice_str)
 
-            if 1 <= choice <= len(py_files):
-                selected_file = os.path.join(directory, py_files[choice - 1])
-                print(f"\n{Colors.YELLOW}Running {py_files[choice - 1]}...{Colors.END}")
-                # Ensure the directory of the script is in sys.path for imports
-                script_dir = os.path.dirname(selected_file)
-                if script_dir not in sys.path:
-                    sys.path.insert(0, script_dir)
-                # Also add the root API directory to sys.path for potential shared modules like config
-                root_api_dir = os.path.dirname(os.path.abspath(__file__))
-                if root_api_dir not in sys.path:
-                     sys.path.insert(1, root_api_dir) # Insert after script dir
-
-                load_and_run_module(selected_file)
-
-                # Clean up sys.path if added
-                if script_dir in sys.path and script_dir != root_api_dir:
-                    try:
-                        sys.path.remove(script_dir)
-                    except ValueError:
-                        pass # Should not happen, but safer
-                if root_api_dir in sys.path and len(sys.path) > 1 and sys.path[1] == root_api_dir:
-                     try:
-                         # Be careful removing if it was already there or is the primary path
-                         # This logic might need refinement depending on structure
-                         pass # Avoid removing the main API dir for now
-                     except ValueError:
-                         pass
-
-
-            elif choice == len(py_files) + 1:
-                return # Go back to the directory menu
+            if 1 <= choice <= len(visible):
+                run_script_file(directory, visible[choice - 1])
+            elif choice == len(visible) + 1:
+                return
             else:
                 print(f"\n{Colors.RED}Invalid choice. Please try again.{Colors.END}")
                 input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
-        except ValueError: # Should be caught by isdigit check, but keep for safety
-            print(f"\n{Colors.RED}Please enter a number.{Colors.END}")
-            input(f"{Colors.CYAN}Press Enter to continue...{Colors.END}")
         except KeyboardInterrupt:
-             print(f"\n{Colors.YELLOW}Returning to Directory Menu...{Colors.END}")
-             return # Go back to the directory menu
+            print(f"\n{Colors.YELLOW}Returning to Directory Menu...{Colors.END}")
+            return
 
 
 def check_env_file():
@@ -647,6 +779,8 @@ def main():
     """Main function to run the program."""
     try:
         check_env_file()  # Check .env before displaying menu
+        if safety:
+            safety.install_error_formatter()
         display_directory_menu()
     except KeyboardInterrupt:
         print(f"\n{Colors.YELLOW}Program interrupted by user. Exiting...{Colors.END}")
