@@ -1,0 +1,4 @@
+# This working tree lives on a shared partition edited from both Linux and
+# Windows, so files kept flipping to CRLF and showing up as wholly rewritten.
+# Normalise to LF in the repository and on checkout, on every platform.
+* text=auto eol=lf
