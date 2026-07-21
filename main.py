@@ -23,6 +23,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Directories that are never API categories, so they must not appear in the menu.
+EXCLUDED_DIRS = {'__pycache__', 'venv', 'env', 'virtualenv', 'node_modules', 'site-packages'}
+
 # ANSI color codes
 class Colors:
     HEADER = '\033[95m'
@@ -45,18 +48,24 @@ def clear_screen():
     """Clear the console screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
+def is_virtualenv(path):
+    """A directory holding pyvenv.cfg is a virtual environment, whatever it is named."""
+    return os.path.isfile(os.path.join(path, 'pyvenv.cfg'))
+
 def get_subdirectories(root_path=None):
     """Get all subdirectories in the given path."""
     if root_path is None:
         # Use the directory of the script as the root path
         root_path = os.path.dirname(os.path.abspath(__file__))
-    
+
     try:
-        # Get all directories in the root path, excluding __pycache__ and hidden directories
-        subdirs = [d for d in os.listdir(root_path) 
-                  if os.path.isdir(os.path.join(root_path, d)) 
-                  and not d.startswith('.') 
-                  and d != '__pycache__']
+        # Get all directories in the root path, excluding hidden dirs, known
+        # non-category names, and any virtual environment regardless of its name
+        subdirs = [d for d in os.listdir(root_path)
+                  if os.path.isdir(os.path.join(root_path, d))
+                  and not d.startswith('.')
+                  and d.lower() not in EXCLUDED_DIRS
+                  and not is_virtualenv(os.path.join(root_path, d))]
         return root_path, subdirs
     except Exception as e:
         print(f"Error getting subdirectories: {str(e)}")
